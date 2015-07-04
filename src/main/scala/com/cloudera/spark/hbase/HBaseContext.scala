@@ -17,32 +17,27 @@
 
 package com.cloudera.spark.hbase
 
+import java.io._
+import java.util.ArrayList
+import java.util.concurrent.Executors
+
+import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.{FileSystem, Path}
+import org.apache.hadoop.hbase.TableName
+import org.apache.hadoop.hbase.client.{Connection, ConnectionFactory, Delete, Get, HConnection, HConnectionManager, Increment, Mutation, Put, Result, Scan}
+import org.apache.hadoop.hbase.client.coprocessor.Batch
+import org.apache.hadoop.hbase.io.ImmutableBytesWritable
+import org.apache.hadoop.hbase.mapreduce.{IdentityTableMapper, TableInputFormat, TableMapReduceUtil}
+import org.apache.hadoop.mapreduce.Job
+import org.apache.hadoop.security.UserGroupInformation
+import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod
+import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.RDD
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.hbase.client.HConnectionManager
-import org.apache.hadoop.hbase.client.Scan
-import org.apache.hadoop.hbase.client.Get
-import java.util.ArrayList
-import org.apache.hadoop.hbase.client.Result
-import scala.reflect.ClassTag
-import org.apache.hadoop.hbase.client.HConnection
-import org.apache.hadoop.hbase.client.Put
-import org.apache.hadoop.hbase.client.Increment
-import org.apache.hadoop.hbase.client.Delete
-import org.apache.spark.{Logging, SerializableWritable, SparkConf, SparkContext}
-import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil
-import org.apache.hadoop.hbase.io.ImmutableBytesWritable
-import org.apache.hadoop.mapreduce.Job
-import org.apache.hadoop.hbase.client.Mutation
 import org.apache.spark.streaming.dstream.DStream
-import java.io._
-import org.apache.hadoop.security.{Credentials, UserGroupInformation}
-import org.apache.hadoop.security.UserGroupInformation.AuthenticationMethod
-import org.apache.hadoop.hbase.mapreduce.TableInputFormat
-import org.apache.hadoop.hbase.mapreduce.IdentityTableMapper
-import org.apache.hadoop.fs.{Path, FileSystem}
+
+import scala.reflect.ClassTag
 
 
 /**
@@ -215,7 +210,7 @@ class HBaseContext(@transient sc: SparkContext,
 
     if (appliedCredentials == false && credentials != null) {
       appliedCredentials = true
-      logCredInformation(credentials)
+     // logCredInformation(credentials)
 
       @transient val ugi = UserGroupInformation.getCurrentUser();
       ugi.addCredentials(credentials)
@@ -226,7 +221,7 @@ class HBaseContext(@transient sc: SparkContext,
     }
   }
 
-  def logCredInformation[T] (credentials2:Credentials) {
+  /*def logCredInformation[T] (credentials2:Credentials) {
     logInfo("credentials:" + credentials2);
     for (a <- 0 until credentials2.getAllSecretKeys.size()) {
       logInfo("getAllSecretKeys:" + a + ":" + credentials2.getAllSecretKeys.get(a));
@@ -235,7 +230,7 @@ class HBaseContext(@transient sc: SparkContext,
     while (it.hasNext) {
       logInfo("getAllTokens:" + it.next());
     }
-  }
+  }*/
 
   /**
    * A simple abstraction over the HBaseContext.streamMapPartition method.
@@ -333,6 +328,25 @@ class HBaseContext(@transient sc: SparkContext,
    */
   def bulkIncrement[T](rdd: RDD[T], tableName: String, f: (T) => Increment, batchSize: Integer) {
     bulkMutation(rdd, tableName, f, batchSize)
+  }
+
+  /**
+   * A simple abstraction over the HBaseContext.foreachPartition method.
+   *
+   * It allow addition support for a user to take a RDD and
+   * generate increments and send them to HBase and process result using callbacks
+   *
+   * The complexity of managing the HConnection is
+   * removed from the developer
+   *
+   * @param rdd       Original RDD with data to iterate over
+   * @param tableName The name of the table to increment to
+   * @param f         function to convert a value in the RDD to a
+   *                  HBase Increments
+   * @param batchSize       The number of increments to batch before sending to HBase
+   */
+  def bulkIncrementWithCallback[T](rdd: RDD[T], tableName: String, f: (T) => Increment, batchSize: Integer, g: Result => Unit) {
+    bulkMutationWithCallback(rdd, tableName, f, batchSize, g)
   }
 
   /**
@@ -474,6 +488,50 @@ class HBaseContext(@transient sc: SparkContext,
             mutationList.clear()
           }
           htable.close()
+        }))
+  }
+
+  /**
+   *  Under lining function to support all bulk mutations using callback
+   *
+   *  May be opened up if requested
+   */
+  private def bulkMutationWithCallback[T](rdd: RDD[T], tableName: String, f: (T) => Mutation, batchSize: Integer, g: Result => Unit) {
+    //df.foreachPartition(p => log.error(s"partition:${p.length}"))
+    rdd.foreachPartition(
+      it => hbaseForeachRowPartition[T](
+        broadcastedConf,
+        it,
+        (iterator, connection) => {
+          val table = connection.getTable(TableName.valueOf(tableName))
+          val mutationList = new ArrayList[Mutation]
+          iterator.foreach(T => {
+            mutationList.add(f(T))
+            if (mutationList.size >= batchSize) {
+
+              val results = Array.ofDim[Object](mutationList.size())
+
+              table.batchCallback(mutationList, results, new Batch.Callback[Result]() {
+                override def update(region: Array[Byte], row: Array[Byte], result: Result): Unit = {
+                  //TODO realize the alert mechanism
+                  g(result)
+                }
+              })
+
+              mutationList.clear()
+            }
+          })
+          if (mutationList.size() > 0) {
+            val results = Array.ofDim[Object](mutationList.size())
+
+            table.batchCallback(mutationList, results, new Batch.Callback[Result]() {
+              override def update(region: Array[Byte], row: Array[Byte], result: Result): Unit = {
+                g(result)
+              }
+            })
+            mutationList.clear()
+          }
+          table.close()
         }))
   }
 
@@ -634,6 +692,28 @@ class HBaseContext(@transient sc: SparkContext,
     val hConnection = HConnectionManager.createConnection(config)
     f(it, hConnection)
     hConnection.close()
+
+  }
+
+  /**
+   *  Under lining wrapper all foreach functions in HBaseContext
+   *
+   */
+  private def hbaseForeachRowPartition[T](
+                                           configBroadcast: Broadcast[SerializableWritable[Configuration]],
+                                           it: Iterator[T],
+                                           f: (Iterator[T], Connection) => Unit) = {
+
+    val config = getConf(configBroadcast)
+
+    val executor = Executors.newFixedThreadPool(10);
+
+    val connection = ConnectionFactory.createConnection(config, executor);
+    //val connection = ConnectionFactory.createConnection(config);
+
+    f(it, connection)
+
+    connection.close()
 
   }
 
